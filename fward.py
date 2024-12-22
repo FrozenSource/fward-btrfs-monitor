@@ -2,8 +2,12 @@ import os
 import sys
 import btrfs
 import yaml
+import subprocess
+import time
+from datetime import datetime, timedelta
 from fward_notifications import *
 from fward_env import *
+from re import search as re_search
 
 class BtrfsDeviceStats(yaml.YAMLObject):
     yaml_tag = "!BtrfsDeviceStats"
@@ -121,82 +125,245 @@ def compare_mounts(old_mounts, new_mounts):
                                 mount_changed_devices.append((new_mount, new_device, old_device))
     return BtrfsMountChanges(added_mounts, removed_mounts, mount_added_devices, mount_removed_devices, mount_changed_devices)
 
+def get_broken_files(mounts, last_check_date_readable, current_date_readable):
+    try:
+        # Run the journalctl command for the time period
+        journalctl_command = [
+            'journalctl', '--grep', 'BTRFS warning', '--output', 'cat', '--since', last_check_date_readable, '--until', current_date_readable
+        ]
+
+        # Execute the command
+        p = subprocess.Popen(journalctl_command, stdout=subprocess.PIPE)
+        output, _ = p.communicate()
+
+        # Split the output by newlines, but remove the last empty line
+        output = output.decode().strip()
+
+        # Now we are going to get the 'ino' and 'logical' from the output
+        inos = []
+        logicals = []
+        for line in output.split('\n'):
+            # Get the device name
+            device = re_search(r'device (\w+)', line)
+            if not device:
+                continue
+            
+            # First look for the ino
+            ino = re_search(r'ino (\d+)', line)
+            if ino:
+                inos.append((device.group(1), ino.group(1)))
+            # Then look for the logical
+            logical = re_search(r'logical (\d+)', line)
+            if logical:
+                logicals.append((device.group(1), logical.group(1)))
+                
+        # Filter out the duplicates
+        inos = list(set(inos))
+        logicals = list(set(logicals))
+        
+        broken_files = []
+        
+        # Now we are going to grab the file names from the inos
+        for [device, ino] in inos:
+            # Get the mountpoint for the device
+            mount_point = None
+            for mount in mounts:
+                for dev in mount.devices:
+                    if dev.device == ("/dev/" + device):
+                        mount_point = mount.mount_point
+                        break
+                if mount_point:
+                    break
+            if not mount_point:
+                warn(f'Could not find mount point for device: {device}, with a broken file ino: {ino}', None)
+                continue
+            
+            # Run the btrfs inspect-internal inode-resolve command
+            btrfs_command = [
+                'btrfs', 'inspect-internal', 'inode-resolve', ino, mount_point
+            ]
+            # if the command returns a non-zero exit code, we skip it
+            try:
+                p = subprocess.Popen(btrfs_command, stdout=subprocess.PIPE)
+                output, _ = p.communicate()
+                output = output.decode().strip()
+                # Now we are going to get the file name
+                file_name = output.split('\n')[-1]
+                broken_files.append(file_name)
+            except subprocess.CalledProcessError as e:
+                error(f'Error while getting broken files: {e}', notifier)
+                continue
+            
+        for [device, logical] in logicals:
+            # Get the mountpoint for the device
+            mount_point = None
+            for mount in mounts:
+                for dev in mount.devices:
+                    if dev.device == ("/dev/" + device):
+                        mount_point = mount.mount_point
+                        break
+                if mount_point:
+                    break
+            if not mount_point:
+                warn(f'Could not find mount point for device: {device}, with a broken file logical: {logical}', notifier)
+                continue
+            
+            # Run the btrfs inspect-internal logical-resolve command
+            btrfs_command = [
+                'btrfs', 'inspect-internal', 'logical-resolve', logical, mount_point
+            ]
+            # if the command returns a non-zero exit code, we skip it
+            try:
+                p = subprocess.Popen(btrfs_command, stdout=subprocess.PIPE)
+                output, _ = p.communicate()
+                output = output.decode().strip()
+                # Now we are going to get the file name
+                file_name = output.split('\n')[-1]
+                broken_files.append(file_name)
+            except subprocess.CalledProcessError as e:
+                error(f'Error while getting broken files: {e}', notifier)
+                continue
+            
+        # Filter out the duplicates
+        broken_files = list(set(broken_files))
+        # Sort the list
+        broken_files.sort()
+        return broken_files
+    except Exception as e:
+        error(f'Error while getting broken files: {e}', None)
+        return None
+    
+# Class to create a lock file
+lock_filename = '/tmp/fward.lock'
+def lock_file():
+    # Try to create the file, if it exists we exit gracefully with a message.
+    try:
+        lock_fd = os.open(lock_filename, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.close(lock_fd)
+    except FileExistsError:
+        lock_fd = None
+        error(f'Lock file exists {lock_filename}, exiting.', notifier)
+        sys.exit(1)
+
+def unlock_file():
+    os.remove(lock_filename)
+
 # Main function
 if __name__ == '__main__':
-    info("Starting Btrfs Monitor v0.1")
-    data_dir = get_environment_variable('FWARD_DATA_DIR', '/var/fward/data')
-    create_directory(data_dir)
-    check_write_permission(data_dir)
-    config_dir = get_environment_variable('FWARD_CONFIG_DIR', '/var/fward/config')
-    create_directory(config_dir)
-    check_write_permission(config_dir)
-    
-    cache_file_name = get_environment_variable('FWARD_CACHE_NAME', 'devices.cache')
-    cache_file = os.path.join(data_dir, cache_file_name)
-    info(f'Cache file: {cache_file}')
-    
-    notifier_config_name = get_environment_variable('FWARD_NOTIFIER_FILE', 'notifier.conf')
-    notifier_config = os.path.join(config_dir, notifier_config_name)
-    
-    notifier = create_apprise_object(notifier_config)
-    if notifier:
-        info(f'Notifier config: {notifier_config}')
-    else:
-        error(f'Could not find notifier config file: {notifier_config}, notifications will not be sent.')
-    
-    # If the program arguments contain --test-notify, we send a test notification.
-    if '--test-notify' in sys.argv:
+    info("Starting Btrfs Monitor v0.2")
+    try:
+        data_dir = get_environment_variable('FWARD_DATA_DIR', '/var/fward/data')
+        create_directory(data_dir)
+        check_write_permission(data_dir)
+        config_dir = get_environment_variable('FWARD_CONFIG_DIR', '/var/fward/config')
+        create_directory(config_dir)
+        check_write_permission(config_dir)
+        
+        cache_file_name = get_environment_variable('FWARD_CACHE_NAME', 'devices.cache')
+        cache_file = os.path.join(data_dir, cache_file_name)
+        info(f'Cache file: {cache_file}')
+        
+        notifier_config_name = get_environment_variable('FWARD_NOTIFIER_FILE', 'notifier.conf')
+        notifier_config = os.path.join(config_dir, notifier_config_name)
+        
+        notifier = create_apprise_object(notifier_config)
         if notifier:
-            notifier.notify('This is a test notification')
+            info(f'Notifier config: {notifier_config}')
         else:
-            print('No notifier found')
+            error(f'Could not find notifier config file: {notifier_config}, notifications will not be sent.')
+        
+        lock_file()
+        
+        # If the program arguments contain --test-notify, we send a test notification.
+        if '--test-notify' in sys.argv:
+            if notifier:
+                notifier.notify('This is a test notification')
+            else:
+                print('No notifier found')
+            sys.exit(0)
+        
+        mounts = get_all_btrfs_mounts()
+        # Print out all the mounts and devices.
+        if '--debug' in sys.argv:
+            for mount in mounts:
+                print(f'Mount point: {mount.mount_point}')
+                for device in mount.devices:
+                    print(f'    Device: {device.device} UUID: {device.uuid}')
+                    print(f'        Write errors: {device.stats.write_errors}')
+                    print(f'        Read errors: {device.stats.read_errors}')
+                    print(f'        Flush errors: {device.stats.flush_errors}')
+                    print(f'        Corruption errors: {device.stats.corruption_errors}')
+                    print(f'        Generation errors: {device.stats.generation_errors}')
+        # If there are no mounts, say so
+        if not mounts:
+            warn('No btrfs mounts found', notifier)
+            sys.exit(0)
+        
+        # Read old cache if it exists
+        old_mounts = read_cache_file(cache_file)    
+        
+        write_cache_file(cache_file, mounts)
+        
+        if old_mounts is None:
+            warn('No old cache found', notifier)
+            sys.exit(0)
+        else:
+            # Compare the old and new mounts
+            changes = compare_mounts(old_mounts, mounts)
+            if changes.added_mounts:
+                for mount in changes.added_mounts:
+                    info(f'Added mount: {mount.mount_point}', notifier)
+            if changes.removed_mounts:
+                for mount in changes.removed_mounts:
+                    warn(f'Removed mount: {mount.mount_point}', notifier)
+            if changes.added_devices:
+                for mount, device in changes.added_devices:
+                    info(f'Added device: {device.device} to {mount.mount_point}', notifier)
+            if changes.removed_devices:
+                for mount, device in changes.removed_devices:
+                    warn(f'Removed device: {device.device} from {mount.mount_point}', notifier)
+                    
+            if changes.changed_devices:
+                for mount, new_device, old_device in changes.changed_devices:
+                    error(f'Changed stats of device: {new_device.device} in {mount.mount_point}\nWrite errors: {old_device.stats.write_errors} -> {new_device.stats.write_errors}\nRead errors: {old_device.stats.read_errors} -> {new_device.stats.read_errors}\nFlush errors: {old_device.stats.flush_errors} -> {new_device.stats.flush_errors}\nCorruption errors: {old_device.stats.corruption_errors} -> {new_device.stats.corruption_errors}\nGeneration errors: {old_device.stats.generation_errors} -> {new_device.stats.generation_errors}', notifier)
+            # if none of the above are true, we are done.
+            if not changes.added_mounts and not changes.removed_mounts and not changes.added_devices and not changes.removed_devices and not changes.changed_devices:
+                info('No changes in mounts or devices.')
+            else:
+                info('Changes found in mounts or devices.', notifier)
+
+        # Now we are going to check for broken files.
+        FWARD_LAST_CHECK_FILE = get_environment_variable('FWARD_LAST_CHECK_FILE', os.path.join(data_dir, 'last_check'))
+
+        # Get the current date
+        current_date = int(time.time())
+
+        # Check if the last check date file exists
+        if os.path.exists(FWARD_LAST_CHECK_FILE):
+            with open(FWARD_LAST_CHECK_FILE, 'r') as file:
+                last_check_date = int(file.read().strip())
+        else:
+            # If the file doesn't exist, initialize it with 1/1/1970
+            last_check_date = 0
+
+        # Convert dates to readable format for journalctl
+        last_check_date_readable = datetime.fromtimestamp(last_check_date).strftime('%Y-%m-%d %H:%M:%S')
+        current_date_readable = datetime.fromtimestamp(current_date).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Store the current date for the next run
+        with open(FWARD_LAST_CHECK_FILE, 'w') as file:
+            file.write(str(current_date))
+            
+        # Run the journalctl command for the time period
+        broken_files = get_broken_files(mounts, last_check_date_readable, current_date_readable)
+        if broken_files:
+            list = '\n'.join(broken_files)
+            raise Exception(f'Broken files detected:\n{list}')
+            
+        unlock_file()
+        info("Nothing broken detected")
         sys.exit(0)
-    
-    mounts = get_all_btrfs_mounts()
-    # Print out all the mounts and devices.
-    if '--debug' in sys.argv:
-        for mount in mounts:
-            print(f'Mount point: {mount.mount_point}')
-            for device in mount.devices:
-                print(f'    Device: {device.device} UUID: {device.uuid}')
-                print(f'        Write errors: {device.stats.write_errors}')
-                print(f'        Read errors: {device.stats.read_errors}')
-                print(f'        Flush errors: {device.stats.flush_errors}')
-                print(f'        Corruption errors: {device.stats.corruption_errors}')
-                print(f'        Generation errors: {device.stats.generation_errors}')
-    # If there are no mounts, say so
-    if not mounts:
-        warn('No btrfs mounts found', notifier)
+    except Exception as e:
+        unlock_file()
+        error(f'{e}', notifier)
         sys.exit(0)
-    
-    # Read old cache if it exists
-    old_mounts = read_cache_file(cache_file)    
-    
-    write_cache_file(cache_file, mounts)
-    
-    if old_mounts is None:
-        warn('No old cache found', notifier)
-        sys.exit(0)
-    
-    changes = compare_mounts(old_mounts, mounts)
-    if changes.added_mounts:
-        for mount in changes.added_mounts:
-            info(f'Added mount: {mount.mount_point}', notifier)
-    if changes.removed_mounts:
-        for mount in changes.removed_mounts:
-            warn(f'Removed mount: {mount.mount_point}', notifier)
-    if changes.added_devices:
-        for mount, device in changes.added_devices:
-            info(f'Added device: {device.device} to {mount.mount_point}', notifier)
-    if changes.removed_devices:
-        for mount, device in changes.removed_devices:
-            warn(f'Removed device: {device.device} from {mount.mount_point}', notifier)
-    if changes.changed_devices:
-        for mount, new_device, old_device in changes.changed_devices:
-            error(f'Changed stats of device: {new_device.device} in {mount.mount_point}\nWrite errors: {old_device.stats.write_errors} -> {new_device.stats.write_errors}\nRead errors: {old_device.stats.read_errors} -> {new_device.stats.read_errors}\nFlush errors: {old_device.stats.flush_errors} -> {new_device.stats.flush_errors}\nCorruption errors: {old_device.stats.corruption_errors} -> {new_device.stats.corruption_errors}\nGeneration errors: {old_device.stats.generation_errors} -> {new_device.stats.generation_errors}', notifier)
-    # if none of the above are true, we are done.
-    if not changes.added_mounts and not changes.removed_mounts and not changes.added_devices and not changes.removed_devices and not changes.changed_devices:
-        info('Done, nothing to report.')
-    else:
-        info('Done, reported changes.')
-    
